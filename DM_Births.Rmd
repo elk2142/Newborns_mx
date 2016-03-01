@@ -1,0 +1,200 @@
+---
+title: "DataMining Group Assignment"
+author: "Erica Kilbride and Gerardo Sierra"
+output: html_document
+---
+
+Our dataset was compiled of birth records for 2 million+ births in Mexico. We subset 100,000 records for faster computations. The original birth dataset was merged with datasets regarding county poverty and regions to provide more background on the mother's circumstances at the child's birth. NA's were defined and removed. 
+
+Our predicted variable was whether the child was of low birth weight or not. The threshold for low birthweight was 2800 grams. We created this binary variable using the interger variable "weight".
+The mother's age variable was squared, as it seemed to have a quadratic relationship to low birthweight.
+```{r}
+
+require(foreign)
+require(sqldf)
+require(ROCR)
+require(ggplot2)
+## DEPENDENT VARIABLE: Low weight
+## IND Variables: Mothers data 
+## MODELS SUGGESTED: LOGIT, CLASS TREES, RANDOM FOREST, BART, 
+
+setwd("/Users/erica_kilbride/Dropbox/Newborns mexico")
+data_red<-read.csv("Birth.csv", header = TRUE)
+data_red$age_sq <- data_red$Mother_age ^2
+```
+
+Our 100,000 records were randomly assigned into testing and training groups. The training group contained 70% of the record while the testing group contained 30%. 
+
+```{r}
+#Split Data
+set.seed(1234)
+
+indexes <- sample(1 : nrow(data_red), size = 0.3 * nrow(data_red))
+testing <- data_red[indexes, ]
+testing <- na.omit(testing)
+training <- data_red[-indexes, ]
+training <- na.omit(training)
+```
+
+In order to measure how well a model predicts, we assigned weights to different elements in the confusion matrix. The reason for assigning weights is that each combination of prediction - observation has different implications. Therefore, the weights we assigned are as follow:
+
+Correctly predict low weight: 20
+We think this is the most desired outcome because it would allow to prevent potential complications.
+
+Correctly predict non - low weight: 0
+It is a desired outcome because it is a correct prediction.
+
+Incorrectly predict low weight: -1
+It is a mistake, and it is penalized, but it is more desirable to be extra conservative than to not predict an actual low-weight.
+
+Incorrectly predict non-low weight: -10
+The worst type of mistake, this could have the most negative consequences. 
+
+Using these weights, we created a "score" for each model. Then, we adjusted the probability threshold in each case in order to maximize this potential score and be able to compare the ability of each model to optimally classify low weights.  
+```{r}
+
+score <- function(Y, Y_hat, th, w) {
+  Z <- as.integer(Y_hat > th)
+  tab <- table(Y, Z)
+  if (nrow(tab)==1) {
+  sc <- tab[1,1]*w[1] +  tab[1,2]*w[2]
+  }
+  if (ncol(tab)==1) {
+  sc <- tab[1,1]*w[1] +  tab[2,1]*w[3]
+  }
+  if (ncol(tab)==2 && nrow(tab)==2) {
+  sc <- tab[1,1]*w[1] +  tab[1,2]*w[2] + tab[2,1]*w[3] + tab[2,2]*w[4]
+  }
+  return(sc/sum(tab))
+}
+
+
+w <- c(0,-1,-10,20)
+```
+
+##Linear Regression
+Our first model was a linear regression model which included the independent variables poverty rate, region, mother's marital status, whether the mother received prenatal care, mother's education level, whether the mother works, mother's age, and mother's age squared.
+```{r}
+
+#Linear Regression
+glm <- glm(Low_weight ~ Poverty_rate + as.factor(Region) + as.factor(Marital_st) + as.factor(Pren_care) + as.factor(Edu_level) + as.factor(Works) + Mother_age +age_sq, data = training)
+summary(glm)
+
+
+#predict
+y_hat_glm <- predict(glm, newdata = testing)
+summary(y_hat_glm)
+
+th <-.2
+opt_glm <- optim(th, score, method = "BFGS", control = list(fnscale=-1), Y = testing$Low_weight, Y_hat = y_hat_glm, w = w)
+ 
+names(opt_glm)
+s_lr <- opt_glm$value
+```
+As the predicted variable was binary, a threshold was needed to assign the y_hat interger a 0 or 1 value. The formula above finds the optimim threshold value and will be used in each model.
+
+##Logistic Regression
+Our next model was a logit model with the same variables used in the linear model. Given that the dependent variable is binary, a logit model woud be more appropriate than a linear model as the outcomes are bounded by a range of 0 to 1.
+
+```{r}
+#Logistic Regression
+logit <- glm(Low_weight ~ Poverty_rate + as.factor(Region) + as.factor(Marital_st) + as.factor(Pren_care) + as.factor(Edu_level) + as.factor(Works) + Mother_age +age_sq, data = training, family = binomial)
+summary(logit)
+
+#predict
+y_hat_logit <- predict(logit, newdata = testing)
+y_hat_logit <- 1 / exp(-y_hat_logit)
+summary(y_hat_logit)
+
+opt_logit <- optim(th, score, method = "BFGS", control = list(fnscale=-1), Y = testing$Low_weight, Y_hat = y_hat_logit, w = w)
+
+
+s_logit <- opt_logit$value
+
+```
+
+##Step function
+Next we used a step function to determine what variables to use in a linear regression. We started with 13 variables, after the step function 11 remained.
+
+```{r}
+#Step
+glm_step <- glm(Low_weight ~ Poverty_rate + as.factor(Region) + as.factor(Marital_st) + as.factor(Pren_care) + as.factor(Edu_level) + as.factor(Works) + Mother_age +age_sq + Number_visits  + as.factor(Last_baby_lives) + Birth_order + as.factor(Ins_Eleg) + Num_preg, data = training)
+
+glm_subset <- step(glm_step, trace = FALSE)
+names(coef(glm_subset))
+setdiff(names(coef(glm_step)), names(coef(glm_subset)))
+
+#prediction
+
+y_hat_step <- predict(glm_subset, newdata = testing)
+summary(y_hat_step)
+
+opt_step <- optim(th, score, method = "BFGS", control = list(fnscale=-1), Y = testing$Low_weight, Y_hat = y_hat_step, w = w)
+
+
+s_step <- opt_step$value
+s_step
+```
+
+##Bagged
+We selected fewer variables for our bagged model, to ensure efficient computation. In this model, only poverty rate, mother's education leverl, and mother's age were used in predicting low weight births.
+
+```{r}
+#Bag/RF
+
+library(randomForest)
+
+bagged <- randomForest(Low_weight ~ Poverty_rate  + Edu_level +  Mother_age , data = training,  importance = TRUE)
+
+bagged
+pb <- plot(bagged)
+pb
+
+
+bag_predictions <- predict(bagged, newdata = testing)
+
+opt_bag <- optim(th, score, method = "BFGS", control = list(fnscale=-1), Y = testing$Low_weight, Y_hat = bag_predictions, w = w)
+
+
+
+s_bag <-opt_bag$value
+```
+
+##Neural Networks
+Finally, neural networks were used. We used two NN models, including all the variables in the first portion of the step model and varying the size of the model. 
+
+```{r}
+#Neural Networks
+
+require(RSNNS)
+x_train <- normalizeData(model.matrix(Low_weight ~ Poverty_rate + as.factor(Region) + as.factor(Marital_st) + as.factor(Pren_care) + as.factor(Edu_level) + as.factor(Works) + Mother_age +age_sq + Number_visits  + as.factor(Last_baby_lives) + Birth_order + as.factor(Ins_Eleg) + Num_preg, data = training))
+
+x_test <- normalizeData(model.matrix(Low_weight ~ Poverty_rate + as.factor(Region) + as.factor(Marital_st) + as.factor(Pren_care) + as.factor(Edu_level) + as.factor(Works) + Mother_age +age_sq + Number_visits  + as.factor(Last_baby_lives) + Birth_order + as.factor(Ins_Eleg) + Num_preg, data = testing))
+
+model<- elman(x_train, training$Low_weight, size=2, maxit = 60, inputsTest = x_test, targetsTest = testing$Low_weight)
+
+predictions <- predict(model, x_test)
+z_NN <- as.integer(predictions > .2)
+
+opt_NN <- optim(th, score, method = "BFGS", control = list(fnscale=-1), Y = testing$Low_weight, Y_hat = predictions, w = w)
+
+
+s_NN <- opt_NN$value
+
+model1<- elman(x_train, training$Low_weight, size=4, maxit = 60, inputsTest = x_test, targetsTest = testing$Low_weight)
+
+predictions1 <- predict(model1, x_test)
+
+opt_NN1 <- optim(th, score, method = "BFGS", control = list(fnscale=-1), Y = testing$Low_weight, Y_hat = predictions1, w = w)
+
+s_NN1 <- opt_NN1$value
+```
+
+##Outcomes
+Below are the compiled scores of each model. As you can see, the bagged model performed the best, considering the cost of misclassification.
+```{r}
+cbind(s_lr, s_logit, s_step, s_bag, s_NN, s_NN1)
+```
+
+
+  
